@@ -1219,7 +1219,7 @@ def run_sim(outdir):
               (0.1, (K_LCTRL, 1)),
               # 設定画面: 発音をレガートに、ｸﾞﾗｲﾄﾞ
               (0.2, (K_ENTER, 1)), (0.2, ("SNAP", "08_menu.png")),
-              ] + [(0.05, (K_DOWN, 1))] * 6 + [
+              ] + [(0.05, (K_DOWN, 1))] * 7 + [
               (0.05, (K_RIGHT, 1)), (0.05, (K_RIGHT, 1)), (0.2, ("SNAP", "09_menu_legato.png")),
               ] + [(0.05, (K_DOWN, 1))] * 6 + [
               (0.05, (K_RIGHT, 1)), (0.2, ("SNAP", "10_menu_chordset.png")),
