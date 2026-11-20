@@ -323,6 +323,9 @@ class App:
         self.presets = list_presets(CHORD_DIRS)
         self.si = -1
         self.song_key = None                    # 曲から推定した (主音, 種類)
+        self.rec_armed = False                  # 録音: 次に最初から再生した時に録る
+        self.rec = None                         # [(on秒, off秒, 音)] 曲の中の時間
+        self.rec_open = {}                      # キーコード → (on秒, 音)
         self.init_synth()
         if self.songs:
             names = [os.path.basename(p) for p in self.songs]
@@ -510,6 +513,74 @@ class App:
             return "なし"
         pg = self.player.song.program.get(ch, 0) if self.player.song else 0
         return f"ch{ch + 1} {GM[pg]}"
+
+    # ---- 録音 (伴奏に合わせて弾いたﾀｲﾐﾝｸﾞを .mid に残す)
+    def toggle_rec(self):
+        self.rec_armed = not self.rec_armed
+        if self.rec_armed and self.cfg["wait"]:
+            self.cfg["wait"] = False                # ﾏﾁ中は曲の時間が止まるので録音とは一緒に使わない
+            self.apply_sound()
+        self.say("録音 ON: SPACE で最初から再生すると、弾いたﾀｲﾐﾝｸﾞを録ります (ﾏﾁは OFF)"
+                 if self.rec_armed else "録音 OFF", 3)
+
+    def rec_note(self, code, n, down):
+        p = self.player
+        if self.rec is None or not p.playing:
+            return
+        with p.lock:
+            t = p.vt
+        if down:
+            if code in self.rec_open:
+                on, nn = self.rec_open.pop(code)
+                self.rec.append((on, t, nn))
+            self.rec_open[code] = (t, n)
+        elif code in self.rec_open:
+            on, nn = self.rec_open.pop(code)
+            self.rec.append((on, max(t, on + 0.05), nn))
+
+    def save_rec(self):
+        """録った音を、曲の伴奏と一緒に ~/midi/<曲名>_recN.mid に保存 (抜いたﾊﾟｰﾄは録った音に置き換え)"""
+        rec, p = self.rec, self.player
+        self.rec = None
+        if not rec and not self.rec_open or not p.song:
+            self.rec_open = {}
+            return None
+        with p.lock:
+            t_end = p.vt
+        for on, n in self.rec_open.values():
+            rec.append((on, max(t_end, on + 0.05), n))
+        self.rec_open = {}
+        song = p.song
+        used = {m[0] & 0x0F for _, m in song.events}
+        ch = p.mute if p.mute is not None else next((c for c in range(16) if c not in used and c != 9), 0)
+        TPS = 960                                   # 120bpm, 480tick/拍 → 1秒 = 960tick
+        ev = [(0, bytes([0xC0 | ch, self.cfg["mel_prog"]])), (0, bytes([0xB0 | ch, 7, self.cfg["mel_vol"]]))]
+        for t, m in song.events:
+            if (m[0] & 0x0F) == ch and (m[0] & 0xF0) in (0x80, 0x90, 0xC0):
+                continue
+            ev.append((round(t * TPS), m))
+        for on, off, n in sorted(rec):
+            ev.append((round(on * TPS), bytes([0x90 | ch, n, 100])))
+            ev.append((round(off * TPS), bytes([0x80 | ch, n, 0])))
+        base = os.path.splitext(os.path.basename(song.path))[0].split("_rec")[0]
+        outdir = os.path.expanduser("~/midi")
+        os.makedirs(outdir, exist_ok=True)
+        i = 1
+        while os.path.exists(os.path.join(outdir, f"{base}_rec{i}.mid")):
+            i += 1
+        path = os.path.join(outdir, f"{base}_rec{i}.mid")
+        try:
+            import make_demo
+            make_demo.write_smf(path, ev, f"{base} rec{i}", 120)
+        except Exception as e:
+            self.say(f"録音を保存できません: {e}", 4)
+            return None
+        cur = song.path
+        self.songs = list_songs(SONG_DIRS)
+        if cur in self.songs:
+            self.si = self.songs.index(cur)
+        self.say(f"録音を保存: {os.path.basename(path)} ({len(rec)}音)", 4)
+        return path
 
     # ---- 表示の部品
     def say(self, msg, sec=2.2):
@@ -744,6 +815,8 @@ class App:
             parts.append((f"✓{len(p.hit)}/{len(p.clusters)}", OK_COL))
         if self.mel.sustain:
             parts.append(("SUS", ACC))
+        if self.rec_armed:
+            parts.insert(0, ("●REC" if self.rec is not None and p.playing else "●", (255, 70, 70)))
         xx = 4
         for txt, col in parts:
             d.text((xx, LCD_H - BOT_H + 2), txt, fill=col, font=self.font_s)
@@ -795,6 +868,8 @@ class App:
                  ("mute", "抜くパート", self.mute_label(p.mute),
                   lambda d: self.set_mute(cyc(self.mute_options(), p.mute, d))),
                  ("wait", "ﾏﾁ (弾くまで待つ)", "ON" if c["wait"] else "OFF", lambda d: setv("wait", not c["wait"])),
+                 ("rec", "録音 (最初から再生すると録る)", "ON ●" if self.rec_armed else "OFF",
+                  lambda d: self.toggle_rec()),
                  ("tempo", "テンポ", f"{c['tempo']}%",
                   lambda d: setv("tempo", max(50, min(150, c["tempo"] + 5 * d)))),
                  ("メロディ",),
@@ -919,8 +994,10 @@ class App:
             if val:
                 self.mel.key_down(code, n)
                 self.answer(n)
+                self.rec_note(code, n, True)
             else:
                 self.mel.key_up(code)
+                self.rec_note(code, n, False)
             return None
         if code in (K_LSHIFT, K_RSHIFT):
             self.mel.set_sustain(bool(val))
@@ -949,8 +1026,12 @@ class App:
                 p.stop(rewind=False)
                 self.say("一時停止 (SPACE で続き)")
             else:
+                if self.rec_armed and p.song and (p.vt == 0 or p.ended):
+                    self.rec, self.rec_open = [], {}
+                    self.say("● 録音中 (曲の終わりで保存)", 2)
                 p.start()
         elif code == K_BS:
+            self.save_rec()
             self.load_song(self.si + 1)
         elif code in (K_LALT, K_RALT):
             c["wait"] = not c["wait"]
@@ -1015,6 +1096,7 @@ class App:
             if self.player.ended and not was_end:
                 p = self.player
                 self.say(f"おわり ✓{len(p.hit)}/{len(p.clusters)}" if p.clusters else "おわり", 4)
+                self.save_rec()
             was_end = self.player.ended
             now = time.time()
             busy = (self.player.playing or self.mel.sounding() or self.ext or self.flash or self.chord.sounding
@@ -1024,6 +1106,7 @@ class App:
                 last = now
 
     def close(self):
+        self.save_rec()
         self.panic()
         self.player.stop()
         self.player.close()
