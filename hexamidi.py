@@ -296,7 +296,7 @@ def save_config(cfg):
 
 
 def song_base(path):
-    """sunday_park_interlude_rec2.mid / _edit.mid → sunday_park_interlude"""
+    """mysong_rec2.mid / mysong_edit.mid → mysong"""
     b = os.path.splitext(os.path.basename(path))[0]
     for suf in ("_edit", "_rec"):
         if suf in b:
