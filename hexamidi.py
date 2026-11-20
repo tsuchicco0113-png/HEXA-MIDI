@@ -1184,19 +1184,31 @@ def probe():
         print("→ sh install.sh を実行して再起動、ユーザーが dialout グループに入っているか確認")
         return 1
     print("31250bps で開きました。ch16 でドミソを鳴らします (Unit MIDI のｲﾔﾎﾝ端子から聞こえればOK)")
+    got = []
+
+    def listen(sec):
+        end = time.time() + sec
+        while time.time() < end:
+            got.extend(m.receive())
+            time.sleep(0.01)
+    m.receive()                                   # 前に溜まっていた分を捨てる
+    got.clear()
     m.program(CH_MEL, 0)
     m.cc(CH_MEL, 7, 110)
     for n in (60, 64, 67, 72):
         m.note_on(CH_MEL, n, 100)
-        time.sleep(0.25)
+        listen(0.25)
         m.note_off(CH_MEL, n)
-    m.drain()
+    listen(0.2)
     print("MIDI IN を3秒聞きます (Bypass にして外の鍵盤を弾いてみてください)...")
-    end, got = time.time() + 3, []
+    end = time.time() + 3
     while time.time() < end:
         got += m.receive()
         time.sleep(0.02)
-    print("受信:", " / ".join(b.hex(" ") for b in got[:10]) if got else "なし")
+    print("受信 (外の鍵盤):", " / ".join(b.hex(" ") for b in got[:10]) if got else "なし")
+    if m.echo_count:
+        print(f"※ 送ったﾒｯｾｰｼﾞが {m.echo_count} 個そのまま戻ってきました (ｴｺｰ)。UART の速度は合っています。")
+        print("  Unit MIDI に電源が来ていない (Grove 5V が OFF) 時などに起きます。ｱﾌﾟﾘではｴｺｰは無視します")
     m.close()
     return 0
 

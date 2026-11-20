@@ -44,6 +44,8 @@ class MidiPort:
         self.duty = 0.0                             # 直近 1 秒の帯域占有率 (%)
         self.p0_peak = 0
         self.tickers = []                           # 送信スレッドで毎周期呼ぶ関数 (グライド)
+        self.recent = collections.deque()           # [(時刻, msg)] 送ったばかりのﾒｯｾｰｼﾞ (ｴｺｰ判定用)
+        self.echo_count = 0                         # 自分の送信が RX に戻ってきた数
         self._rx_st, self._rx_buf, self._rx_sysex = None, [], False
         self._stop = False
         if not writer:
@@ -135,23 +137,32 @@ class MidiPort:
             last = now
             with self.lock:
                 self.p0_peak = max(self.p0_peak, len(self.p0))
-                chunk = b"".join(self.p0)
+                msgs = list(self.p0)
+                chunk = b"".join(msgs)
                 self.p0.clear()
                 self.tokens = max(0.0, self.tokens - len(chunk))
                 for ch in list(self.bend):              # P2 ベンド
                     if self.tokens < 3:
                         break
                     v = self.bend.pop(ch)
-                    chunk += bytes([0xE0 | ch, v & 0x7F, (v >> 7) & 0x7F])
+                    m = bytes([0xE0 | ch, v & 0x7F, (v >> 7) & 0x7F])
+                    msgs.append(m)
+                    chunk += m
                     self.tokens -= 3
                 for key in list(self.ccs):              # P3 CC
                     if self.tokens < 3:
                         break
                     v = self.ccs.pop(key)
-                    chunk += bytes([0xB0 | key[0], key[1], v])
+                    m = bytes([0xB0 | key[0], key[1], v])
+                    msgs.append(m)
+                    chunk += m
                     self.tokens -= 3
             if chunk:
                 self._write(chunk)
+                with self.lock:
+                    self.recent.extend((now, m) for m in msgs if m[0] < 0xF0)
+                    while self.recent and now - self.recent[0][0] > 0.5:
+                        self.recent.popleft()
             if now - t_duty >= 1.0:
                 self.duty = self.tx_bytes / BYTES_PER_SEC / (now - t_duty) * 100
                 self.tx_bytes, t_duty = 0, now
@@ -166,7 +177,21 @@ class MidiPort:
             raw = self.ser.read(512)
         except Exception:
             return []
-        return self.parse(raw)
+        return self.drop_echo(self.parse(raw))
+
+    def drop_echo(self, msgs):
+        """自分が送ったﾒｯｾｰｼﾞが RX に戻ってきた分 (ｴｺｰ) を捨てる。
+        捨てないと MIDI IN ｽﾙｰが送り返して、送信が無限に回り続ける"""
+        out = []
+        with self.lock:
+            for m in msgs:
+                hit = next((i for i, (_, r) in enumerate(self.recent) if r == m), None)
+                if hit is None:
+                    out.append(m)
+                else:
+                    del self.recent[hit]
+                    self.echo_count += 1
+        return out
 
     def parse(self, raw):
         out = []
