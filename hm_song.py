@@ -17,8 +17,11 @@ class Song:
         self.events = []        # [(秒, bytes)]
         self.notes = {}         # ch → [(on秒, off秒, note)]
         self.program = {}       # ch → 最初の program
+        self.tempo_us = None    # 最初のﾃﾝﾎﾟ (4分音符のﾏｲｸﾛ秒)。ﾀｲﾐﾝｸﾞ調整の目盛りと保存に使う
         self._load(open(path, "rb").read())
         self.times = [t for t, _ in self.events]
+        if self.tempo_us is None:
+            self.tempo_us = 500000
         self.length = self.events[-1][0] if self.events else 0.0
         self.channels = sorted(ch for ch in self.notes if ch != 9 and len(self.notes[ch]) >= 4)
         self.melody = self._guess_melody()
@@ -93,6 +96,8 @@ class Song:
             last = tick
             if kind == "tempo":
                 tempo = val
+                if self.tempo_us is None:
+                    self.tempo_us = val
                 continue
             msg = val
             self.events.append((t, msg))
@@ -148,6 +153,7 @@ class Player:
         self.hit = set()                    # 正解した cluster の番号
         self.missed = 0
         self.ended = False
+        self.stop_at = None                 # この時間で止める (ﾀｲﾐﾝｸﾞ調整の試聴)
         self._stop = False
         self.th = threading.Thread(target=self._run, daemon=True)
         self.th.start()
@@ -176,6 +182,20 @@ class Player:
                     self.clusters.append((on, {n}))
         self.ci = bisect.bisect_left([c[0] for c in self.clusters], self.vt - 1e-6)
 
+    def play_range(self, t0, t1):
+        """t0〜t1 秒だけ鳴らす (ﾀｲﾐﾝｸﾞ調整の試聴)"""
+        with self.lock:
+            if not self.song:
+                return
+            self.stop(rewind=False)
+            self.vt = max(0.0, t0)
+            self.idx = bisect.bisect_left(self.song.times, self.vt - 1e-6)
+            self.ci = len(self.clusters)
+            self.stop_at = t1
+            self.ended = False
+            self.playing = True
+            self._t = time.monotonic()
+
     def start(self):
         with self.lock:
             if not self.song:
@@ -184,6 +204,7 @@ class Player:
                 self.vt, self.idx = 0.0, 0
                 self._rebuild()
             self.ended = False
+            self.stop_at = None
             self.playing = True
             self._t = time.monotonic()
 
@@ -254,7 +275,11 @@ class Player:
                                 and (msg[0] & 0xF0) in (0x80, 0x90)):
                             self.midi.raw(msg)
                         self.idx += 1
-                    if self.idx >= len(ev):
+                    if self.stop_at is not None and self.vt >= self.stop_at:
+                        self.stop_at = None
+                        self.playing = self.waiting = False
+                        self.midi.all_off([c for c in range(16) if c not in self.own])
+                    elif self.idx >= len(ev):
                         self.missed = max(0, len(self.clusters) - len(self.hit))
                         self.playing = self.waiting = False
                         self.ended = True
@@ -267,3 +292,11 @@ class Player:
         self._stop = True
 
 
+
+
+def write_song(path, events, name, tempo_us):
+    """[(秒, bytes)] を SMF (format 0) で保存。ﾃﾝﾎﾟは tempo_us (曲の元のﾃﾝﾎﾟ) のまま"""
+    import make_demo
+    tpq = make_demo.TPQ
+    ev = [(max(0, round(t * 1e6 / tempo_us * tpq)), m) for t, m in events]
+    make_demo.write_smf(path, ev, name, 60_000_000 / tempo_us)

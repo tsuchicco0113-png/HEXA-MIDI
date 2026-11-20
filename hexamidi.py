@@ -40,7 +40,7 @@ from hm_midi import MidiPort, find_port                                   # noqa
 from hm_music import (CHORD_HI_KEYS, CHORD_KEYS, FAVORITES, GM, NOTE_NAMES, SCALE_KEYS,  # noqa: E402
                       SCALE_ORDER, SCALES, ChordEngine, MelodyEngine, auto_chords, detect_key,
                       is_black, list_presets, note_name, scale_notes)
-from hm_song import Player, Song, list_songs                             # noqa: E402
+from hm_song import Player, Song, list_songs, write_song                 # noqa: E402
 
 VERSION = "0.2.0"
 LCD_W, LCD_H = 320, 170
@@ -295,6 +295,212 @@ def save_config(cfg):
         pass
 
 
+def song_base(path):
+    """sunday_park_interlude_rec2.mid / _edit.mid → sunday_park_interlude"""
+    b = os.path.splitext(os.path.basename(path))[0]
+    for suf in ("_edit", "_rec"):
+        if suf in b:
+            b = b.split(suf)[0]
+    return b
+
+
+# ================================================================ ﾀｲﾐﾝｸﾞ調整
+class TimingEditor:
+    """曲の1つのﾊﾟｰﾄ (抜くﾊﾟｰﾄ/ﾒﾛﾃﾞｨ) の音を 1 つずつ前後にずらす画面
+      Z C (←→) 音を選ぶ   F X (↑↓) 早く/遅く   TAB 刻み (16分/32分/10ms)
+      SPACE 前後を聞く     A 最初から全部聞く   BS 1つ戻す   ENTER 保存   ESC もどる"""
+    STEPS = [("16分", 4), ("32分", 8), ("10ms", None)]
+
+    def __init__(self, app, song, ch):
+        self.app, self.ch = app, ch
+        self.src = song
+        self.beat = song.tempo_us / 1e6
+        self.notes = [[on, off, n] for on, off, n in song.notes.get(ch, [])]
+        self.others = [(t, m) for t, m in song.events
+                       if not ((m[0] & 0x0F) == ch and (m[0] & 0xF0) in (0x80, 0x90))]
+        self.sel = 0
+        self.step_i = 0
+        self.undo = []
+        self.dirty = False
+        self.saved_path = None
+        self.confirm = False
+        self.preview_song = None
+
+    # ---- 編集
+    def step_sec(self):
+        name, div = self.STEPS[self.step_i]
+        return self.beat / div if div else 0.010
+
+    def move(self, d):
+        if not self.notes:
+            return
+        self.undo.append([x[:] for x in self.notes])
+        del self.undo[:-50]
+        nt = self.notes[self.sel]
+        dur = nt[1] - nt[0]
+        g = self.step_sec()
+        k = nt[0] / g
+        new_on = (math.floor(k + 1e-6) + 1) * g if d > 0 else (math.ceil(k - 1e-6) - 1) * g   # 次の目盛りへ
+        new_on = max(0.0, new_on)
+        prev = self.notes[self.sel - 1] if self.sel > 0 else None
+        nxt = self.notes[self.sel + 1] if self.sel + 1 < len(self.notes) else None
+        if prev and new_on <= prev[0] + 0.02:         # 前の音を追い越さない
+            new_on = prev[0] + 0.02
+        if nxt and new_on >= nxt[0] - 0.02:           # 次の音を追い越さない
+            new_on = nxt[0] - 0.02
+        nt[0], nt[1] = new_on, new_on + dur
+        if nxt and nt[1] > nxt[0] - 0.02:             # 次と重なったら切る
+            nt[1] = max(nt[0] + 0.04, nxt[0] - 0.02)
+        if prev and prev[1] > nt[0] - 0.02:           # 前の音の伸びを切る
+            prev[1] = max(prev[0] + 0.04, nt[0] - 0.02)
+        self.dirty = True
+
+    def events(self):
+        ev = list(self.others)
+        for on, off, n in self.notes:
+            ev.append((on, bytes([0x90 | self.ch, n, 100])))
+            ev.append((off, bytes([0x80 | self.ch, n, 0])))
+        ev.sort(key=lambda e: (e[0], 0 if (e[1][0] & 0xF0) == 0x80 else 1))
+        return ev
+
+    def save(self):
+        base = song_base(self.src.path)
+        outdir = os.path.expanduser("~/midi")
+        os.makedirs(outdir, exist_ok=True)
+        path = os.path.join(outdir, f"{base}_edit.mid")
+        write_song(path, self.events(), f"{base} edit", self.src.tempo_us)
+        self.saved_path, self.dirty = path, False
+        return path
+
+    # ---- 試聴 (今の編集を一時ﾌｧｲﾙにして鳴らす)
+    def preview(self, whole=False):
+        tmp = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "hexamidi_preview.mid")
+        write_song(tmp, self.events(), "preview", self.src.tempo_us)
+        song = Song(tmp)
+        p = self.app.player
+        p.load(song)
+        p.wait_mode = False
+        if whole:
+            p.play_range(0.0, song.length + 0.1)
+            return
+        bar = self.beat * 4
+        t = self.notes[self.sel][0] if self.notes else 0
+        b = int(t // bar)
+        p.play_range(max(0, b - 1) * bar, (b + 1) * bar + 0.05)
+
+    # ---- キー
+    def key(self, code):
+        ch = CODE_CH.get(code)
+        if self.confirm:
+            if code == K_ENTER:
+                self.save()
+                return "close"
+            if code == K_ESC:
+                return "close"
+            if code == K_BS:
+                self.confirm = False
+            return None
+        if code in (K_LEFT,) or ch == "z":
+            self.sel = max(0, self.sel - 1)
+        elif code in (K_RIGHT,) or ch == "c":
+            self.sel = min(len(self.notes) - 1, self.sel + 1)
+        elif code in (K_UP,) or ch == "f":
+            self.move(-1)
+        elif code in (K_DOWN,) or ch == "x":
+            self.move(1)
+        elif code == K_TAB:
+            self.step_i = (self.step_i + 1) % len(self.STEPS)
+            self.app.say(f"刻み: {self.STEPS[self.step_i][0]}", 1.2)
+        elif code == K_SPACE:
+            self.preview()
+        elif ch == "a":
+            self.preview(whole=True)
+        elif code == K_BS:
+            if self.undo:
+                self.notes = self.undo.pop()
+                self.dirty = True
+                self.app.say("1つ戻しました", 1)
+        elif code == K_ENTER:
+            path = self.save()
+            self.app.say(f"保存: {os.path.basename(path)}", 2.5)
+        elif code == K_ESC:
+            if self.dirty:
+                self.confirm = True
+            else:
+                return "close"
+        return None
+
+    # ---- 画面
+    def draw(self):
+        a = self.app
+        img = a.bg.copy()
+        d = ImageDraw.Draw(img)
+        d.rectangle((0, 0, LCD_W, TOP_H - 1), fill=(0, 0, 0))
+        d.text((5, 1), "HEXA MIDI", fill=ACC, font=a.font_bs)
+        d.text((5 + a.font_bs.getlength("HEXA MIDI") + 8, 3), f"ﾀｲﾐﾝｸﾞ調整  ch{self.ch + 1}  刻み {self.STEPS[self.step_i][0]}",
+               fill=FG, font=a.font_t)
+        if not self.notes:
+            d.text((10, 60), "このﾊﾟｰﾄには音がありません", fill=SUB, font=a.font)
+            return img
+        bar = self.beat * 4
+        sel = self.notes[self.sel]
+        span = bar * 2
+        t0 = min(max(0.0, sel[0] - span / 2), max(0.0, self.notes[-1][1] - span))
+        y0, y1 = TOP_H + 20, LCD_H - BOT_H - 22
+        lo = min(n for _, _, n in self.notes) - 1
+        hi = max(n for _, _, n in self.notes) + 1
+        rh = (y1 - y0) / (hi - lo + 1)
+
+        def X(t):
+            return (t - t0) / span * LCD_W
+        # 目盛り
+        g = self.beat / 4
+        k = int(t0 // g)
+        while k * g <= t0 + span:
+            x = X(k * g)
+            col = (90, 60, 110) if k % 16 == 0 else (52, 56, 72) if k % 4 == 0 else (30, 33, 44)
+            d.line((x, y0, x, y1), fill=col, width=2 if k % 16 == 0 else 1)
+            if k % 16 == 0:
+                d.text((x + 2, y0 - 13), f"{k // 16 + 1}小節", fill=SUB, font=a.font_s)
+            k += 1
+        # 音
+        for i, (on, off, n) in enumerate(self.notes):
+            if off < t0 or on > t0 + span:
+                continue
+            y = y1 - (n - lo + 1) * rh
+            col = ACC if i == self.sel else GUIDE_COL
+            d.rounded_rectangle((X(on), y, max(X(on) + 3, X(off)), y + rh - 1), 2, fill=col)
+            if i == self.sel:
+                d.text((X(on), y - 12), note_name(n), fill=ACC, font=a.font_s)
+        # 再生位置
+        p = a.player
+        if p.playing:
+            x = X(p.vt)
+            d.line((x, y0, x, y1), fill=(120, 255, 160), width=1)
+        # 選んでいる音の情報
+        beat_pos = sel[0] / self.beat
+        bi = int(beat_pos // 4)
+        rem = beat_pos - bi * 4
+        sixteenth = rem * 4
+        info = (f"{self.sel + 1}/{len(self.notes)}  {note_name(sel[2])}  {bi + 1}小節 {int(rem) + 1}拍目"
+                f"{'' if abs(sixteenth - round(sixteenth)) > 0.05 else ' +' + str(int(round(sixteenth)) % 4) + '/16'}"
+                f"  ({sel[0]:.2f}秒)")
+        d.text((6, LCD_H - BOT_H - 18), info, fill=FG, font=a.font_s)
+        d.rectangle((0, LCD_H - BOT_H, LCD_W, LCD_H), fill=(0, 0, 0))
+        d.text((4, LCD_H - BOT_H + 2), "ZC:選ぶ FX:前後 TAB:刻み SPACE:聞く A:全部 BS:戻す ENTER:保存",
+               fill=(210, 210, 210), font=a.font_s)
+        if self.confirm:
+            img2 = Image.blend(img, Image.new("RGB", img.size), 0.6)
+            d2 = ImageDraw.Draw(img2)
+            d2.rounded_rectangle((40, 45, LCD_W - 40, LCD_H - 40), 8, fill=(26, 30, 38), outline=ACC, width=2)
+            for i, (txt, f, c) in enumerate([("変更を保存しますか?", a.font, FG),
+                                             ("ENTER:保存  ESC:捨てる  BS:続ける", a.font_s, ACC)]):
+                d2.text(((LCD_W - f.getlength(txt)) / 2, 62 + i * 26), txt, fill=c, font=f)
+            img = img2
+        a.draw_toast(ImageDraw.Draw(img), TOP_H + 2)
+        return img
+
+
 # ================================================================ アプリ
 class App:
     def __init__(self, fb, keys, midi, cfg=None, save=True):
@@ -326,6 +532,7 @@ class App:
         self.rec_armed = False                  # 録音: 次に最初から再生した時に録る
         self.rec = None                         # [(on秒, off秒, 音)] 曲の中の時間
         self.rec_open = {}                      # キーコード → (on秒, 音)
+        self.editor = None                      # ﾀｲﾐﾝｸﾞ調整画面
         self.init_synth()
         if self.songs:
             names = [os.path.basename(p) for p in self.songs]
@@ -514,6 +721,35 @@ class App:
         pg = self.player.song.program.get(ch, 0) if self.player.song else 0
         return f"ch{ch + 1} {GM[pg]}"
 
+    # ---- ﾀｲﾐﾝｸﾞ調整
+    def open_editor(self):
+        p = self.player
+        if not p.song:
+            self.say("曲がありません")
+            return
+        ch = p.mute if p.mute is not None else p.song.melody
+        if ch is None:
+            self.say("調整するﾊﾟｰﾄがありません")
+            return
+        self.menu = None
+        self.panic()
+        p.stop()
+        self.editor = TimingEditor(self, p.song, ch)
+        self.say("Z C で音を選んで F X でずらす。SPACE で前後を聞く", 3)
+
+    def close_editor(self):
+        ed = self.editor
+        self.editor = None
+        self.player.stop()
+        self.songs = list_songs(SONG_DIRS)
+        target = ed.saved_path or ed.src.path
+        if target in self.songs:
+            self.load_song(self.songs.index(target), quiet=True)
+            if ed.saved_path:
+                self.say(f"{os.path.basename(target)} を選びました", 2.5)
+        else:
+            self.load_song(self.si, quiet=True)
+
     # ---- 録音 (伴奏に合わせて弾いたﾀｲﾐﾝｸﾞを .mid に残す)
     def toggle_rec(self):
         self.rec_armed = not self.rec_armed
@@ -553,16 +789,15 @@ class App:
         song = p.song
         used = {m[0] & 0x0F for _, m in song.events}
         ch = p.mute if p.mute is not None else next((c for c in range(16) if c not in used and c != 9), 0)
-        TPS = 960                                   # 120bpm, 480tick/拍 → 1秒 = 960tick
-        ev = [(0, bytes([0xC0 | ch, self.cfg["mel_prog"]])), (0, bytes([0xB0 | ch, 7, self.cfg["mel_vol"]]))]
+        ev = [(0.0, bytes([0xC0 | ch, self.cfg["mel_prog"]])), (0.0, bytes([0xB0 | ch, 7, self.cfg["mel_vol"]]))]
         for t, m in song.events:
             if (m[0] & 0x0F) == ch and (m[0] & 0xF0) in (0x80, 0x90, 0xC0):
                 continue
-            ev.append((round(t * TPS), m))
+            ev.append((t, m))
         for on, off, n in sorted(rec):
-            ev.append((round(on * TPS), bytes([0x90 | ch, n, 100])))
-            ev.append((round(off * TPS), bytes([0x80 | ch, n, 0])))
-        base = os.path.splitext(os.path.basename(song.path))[0].split("_rec")[0]
+            ev.append((on, bytes([0x90 | ch, n, 100])))
+            ev.append((off, bytes([0x80 | ch, n, 0])))
+        base = song_base(song.path)
         outdir = os.path.expanduser("~/midi")
         os.makedirs(outdir, exist_ok=True)
         i = 1
@@ -570,8 +805,7 @@ class App:
             i += 1
         path = os.path.join(outdir, f"{base}_rec{i}.mid")
         try:
-            import make_demo
-            make_demo.write_smf(path, ev, f"{base} rec{i}", 120)
+            write_song(path, ev, f"{base} rec{i}", song.tempo_us)
         except Exception as e:
             self.say(f"録音を保存できません: {e}", 4)
             return None
@@ -661,6 +895,8 @@ class App:
 
     # ---- メイン画面
     def draw(self):
+        if self.editor is not None:
+            return self.editor.draw()
         if self.menu is not None:
             return self.draw_menu()
         img = self.bg.copy()
@@ -870,6 +1106,9 @@ class App:
                  ("wait", "ﾏﾁ (弾くまで待つ)", "ON" if c["wait"] else "OFF", lambda d: setv("wait", not c["wait"])),
                  ("rec", "録音 (最初から再生すると録る)", "ON ●" if self.rec_armed else "OFF",
                   lambda d: self.toggle_rec()),
+                 ("edit", "ﾀｲﾐﾝｸﾞ調整 (→ で開く)",
+                  f"ch{(p.mute if p.mute is not None else (p.song.melody if p.song and p.song.melody is not None else 0)) + 1}",
+                  lambda d: self.open_editor() if d > 0 else None),
                  ("tempo", "テンポ", f"{c['tempo']}%",
                   lambda d: setv("tempo", max(50, min(150, c["tempo"] + 5 * d)))),
                  ("メロディ",),
@@ -976,6 +1215,10 @@ class App:
 
     # ---- ループ
     def on_key(self, code, val):
+        if self.editor is not None:
+            if val and self.editor.key(code) == "close":
+                self.close_editor()
+            return None
         if self.menu is not None:
             if val:
                 self.menu_key(code)
@@ -1100,7 +1343,7 @@ class App:
             was_end = self.player.ended
             now = time.time()
             busy = (self.player.playing or self.mel.sounding() or self.ext or self.flash or self.chord.sounding
-                    or now < self.toast[1] + 0.3 or self.menu is not None)
+                    or now < self.toast[1] + 0.3 or self.menu is not None or self.editor is not None)
             if now - last > (0.066 if busy else 0.5):
                 self.fb.show(self.draw())
                 last = now
