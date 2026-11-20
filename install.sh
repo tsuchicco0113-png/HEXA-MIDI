@@ -16,7 +16,7 @@ sudo apt-get install -y python3-pil python3-numpy python3-serial >/dev/null
 echo "== files"
 chmod +x "$DIR/hexamidi.py" "$DIR/hexamidi"
 sudo ln -sf "$DIR/hexamidi" /usr/local/bin/hexamidi
-mkdir -p "$DIR/songs" "$HOME/midi"
+mkdir -p "$DIR/songs" "$HOME/midi/chords"
 [ -f "$DIR/songs/01_twinkle.mid" ] || python3 "$DIR/make_demo.py" "$DIR/songs"
 
 echo "== UART (Grove = GPIO14/15) を MIDI 用に空ける"
@@ -66,7 +66,7 @@ if [ -d "$APPL/applications" ]; then
 [Desktop Entry]
 Type=Application
 Name=HEXA MIDI
-Comment=Play along with MIDI songs via Unit MIDI
+Comment=FREE / SCALE keyboard + chords + play-along via Unit MIDI
 Exec=/usr/local/bin/hexamidi
 Icon=share/images/hexamidi.png
 Terminal=false

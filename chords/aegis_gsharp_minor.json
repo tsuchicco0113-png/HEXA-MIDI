@@ -1,0 +1,127 @@
+{
+ "name": "Aegis G#m (M3.5)",
+ "key": "G#",
+ "scale": "マイナー",
+ "chords": [
+  {
+   "keyboard": "1",
+   "name": "G#m7",
+   "notes": [
+    44,
+    54,
+    59,
+    63
+   ]
+  },
+  {
+   "keyboard": "2",
+   "name": "C#/G#",
+   "notes": [
+    44,
+    53,
+    56,
+    61
+   ]
+  },
+  {
+   "keyboard": "3",
+   "name": "E/G#",
+   "notes": [
+    44,
+    52,
+    59,
+    64
+   ]
+  },
+  {
+   "keyboard": "4",
+   "name": "F#add9",
+   "notes": [
+    42,
+    58,
+    61,
+    68
+   ]
+  },
+  {
+   "keyboard": "5",
+   "name": "B/D#",
+   "notes": [
+    39,
+    59,
+    63,
+    66
+   ]
+  },
+  {
+   "keyboard": "6",
+   "name": "Eadd9",
+   "notes": [
+    40,
+    59,
+    64,
+    66
+   ]
+  },
+  {
+   "keyboard": "7",
+   "name": "F#",
+   "notes": [
+    42,
+    61,
+    66,
+    70
+   ]
+  },
+  {
+   "keyboard": "8",
+   "name": "G#m",
+   "notes": [
+    44,
+    63,
+    68,
+    71
+   ]
+  },
+  {
+   "keyboard": "g",
+   "name": "B/D#+",
+   "notes": [
+    51,
+    71,
+    75,
+    78
+   ]
+  },
+  {
+   "keyboard": "h",
+   "name": "Eadd9+",
+   "notes": [
+    52,
+    71,
+    76,
+    78
+   ]
+  },
+  {
+   "keyboard": "j",
+   "name": "F#+",
+   "notes": [
+    54,
+    73,
+    78,
+    82
+   ]
+  },
+  {
+   "keyboard": "k",
+   "name": "G#m+",
+   "notes": [
+    56,
+    75,
+    80,
+    83
+   ]
+  }
+ ]
+}
