@@ -210,13 +210,18 @@ class Player:
                     self._t = time.monotonic()
                     return True
                 return False
+            early = 1.5 if self.wait_mode else EARLY_OK       # ﾏﾁの時は先に弾いてもよい
             for j in range(self.ci, len(self.clusters)):    # 少し早く弾いた分も正解
                 t, notes = self.clusters[j]
-                if t - self.vt > EARLY_OK:
+                if t - self.vt > early:
                     break
-                if j not in self.hit and n % 12 in {x % 12 for x in notes}:
+                if j in self.hit:
+                    continue
+                if n % 12 in {x % 12 for x in notes}:
                     self.hit.add(j)
                     return True
+                if self.wait_mode:                           # 次の音が違えばそこで止める
+                    break
             for j in range(self.ci - 1, -1, -1):              # 少し遅れた分も
                 t, notes = self.clusters[j]
                 if self.vt - t > 0.25:
