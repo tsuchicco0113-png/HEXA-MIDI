@@ -72,10 +72,12 @@ Cardputer-ADV 時代の **Aegis-Synth M3.5** (ｽｹｰﾙ鍵盤・ﾎｰﾙﾄ�
 
 ## はじめる
 ```sh
+git clone https://github.com/tsuchicco0113-png/HEXA-MIDI.git ~/hexamidi
 cd ~/hexamidi && sh install.sh     # sudo は付けない
 sudo reboot                        # 初回だけ (UART・権限・ｱｲｺﾝの反映)
 hexamidi --probe                   # ドミソが鳴れば OK
 ```
+更新は `cd ~/hexamidi && git pull && sh install.sh`
 - Unit MIDI を **右側の Grove** に付属ｹｰﾌﾞﾙでつなぐ (Grove は初期状態で UART = GPIO14 TX / GPIO15 RX)
 - **Settings > ExtPort で Grove の 5V を ON** (初期状態は OFF。Grove は UART のまま)
 - Unit MIDI のｽｲｯﾁ: 外の鍵盤を使う時は **Bypass**。Separate だと CPZ の RX が浮くので、変な音が出たら設定で MIDI IN ｽﾙｰを OFF
