@@ -316,6 +316,7 @@ def song_base(path):
 class TimingEditor:
     """曲の1つのﾊﾟｰﾄ (抜くﾊﾟｰﾄ/ﾒﾛﾃﾞｨ) の音を 1 つずつ前後にずらす画面
       Z C (←→) 音を選ぶ   F X (↑↓) 早く/遅く   TAB 刻み (16分/32分/10ms)
+      Q W 頭だけ 早く/遅く (前に伸ばす/前を縮める)   E R 終わりだけ 早く/遅く (後ろを縮める/後ろに伸ばす)
       SPACE 前後を聞く     A 最初から全部聞く   BS 1つ戻す   ENTER 保存   ESC もどる"""
     STEPS = [("16分", 4), ("32分", 8), ("10ms", None)]
 
@@ -361,6 +362,34 @@ class TimingEditor:
             nt[1] = max(nt[0] + 0.04, nxt[0] - 0.02)
         if prev and prev[1] > nt[0] - 0.02:           # 前の音の伸びを切る
             prev[1] = max(prev[0] + 0.04, nt[0] - 0.02)
+        self.dirty = True
+
+    def stretch(self, edge, d):
+        """片側だけ動かす。edge="head": 頭 (終わりはそのまま) / "tail": 終わり (頭はそのまま)
+        d=-1 で早く、+1 で遅く (次の目盛りへ)"""
+        if not self.notes:
+            return
+        self.undo.append([x[:] for x in self.notes])
+        del self.undo[:-50]
+        nt = self.notes[self.sel]
+        prev = self.notes[self.sel - 1] if self.sel > 0 else None
+        nxt = self.notes[self.sel + 1] if self.sel + 1 < len(self.notes) else None
+        g = self.step_sec()
+        i = 0 if edge == "head" else 1
+        k = nt[i] / g
+        t = (math.floor(k + 1e-6) + 1) * g if d > 0 else (math.ceil(k - 1e-6) - 1) * g
+        if edge == "head":
+            lo = (prev[0] + 0.02) if prev else 0.0          # 前の音の頭は追い越さない
+            t = max(lo, min(t, nt[1] - 0.04))               # 長さは 0.04秒は残す
+            nt[0] = t
+            if prev and prev[1] > t - 0.02:                 # 前の音の伸びを切る
+                prev[1] = max(prev[0] + 0.04, t - 0.02)
+        else:
+            hi = (nxt[0] - 0.02) if nxt else t              # 次の音の頭までしか伸ばさない
+            new = min(t, hi)
+            if d > 0:
+                new = max(new, nt[1])                       # 伸ばす時に縮まないように
+            nt[1] = max(nt[0] + 0.04, new)
         self.dirty = True
 
     def events(self):
@@ -416,6 +445,14 @@ class TimingEditor:
             self.move(-1)
         elif code in (K_DOWN,) or ch == "x":
             self.move(1)
+        elif ch == "q":
+            self.stretch("head", -1)                        # 頭を早く = 前に伸ばす
+        elif ch == "w":
+            self.stretch("head", 1)                         # 頭を遅く = 前を縮める
+        elif ch == "e":
+            self.stretch("tail", -1)                        # 終わりを早く = 後ろを縮める
+        elif ch == "r":
+            self.stretch("tail", 1)                         # 終わりを遅く = 後ろに伸ばす
         elif code == K_TAB:
             self.step_i = (self.step_i + 1) % len(self.STEPS)
             self.app.say(f"刻み: {self.STEPS[self.step_i][0]}", 1.2)
@@ -492,10 +529,10 @@ class TimingEditor:
         sixteenth = rem * 4
         info = (f"{self.sel + 1}/{len(self.notes)}  {note_name(sel[2])}  {bi + 1}小節 {int(rem) + 1}拍目"
                 f"{'' if abs(sixteenth - round(sixteenth)) > 0.05 else ' +' + str(int(round(sixteenth)) % 4) + '/16'}"
-                f"  ({sel[0]:.2f}秒)")
+                f"  ({sel[0]:.2f}秒 長さ{sel[1] - sel[0]:.2f})")
         d.text((6, LCD_H - BOT_H - 18), info, fill=FG, font=a.font_s)
         d.rectangle((0, LCD_H - BOT_H, LCD_W, LCD_H), fill=(0, 0, 0))
-        d.text((4, LCD_H - BOT_H + 2), "ZC:選ぶ FX:前後 TAB:刻み SPACE:聞く A:全部 BS:戻す ENTER:保存",
+        d.text((4, LCD_H - BOT_H + 2), "ZC選ぶ FX移動 QW頭 ER終わり TAB刻み SPC聞く A全部 BS戻す ⏎保存",
                fill=(210, 210, 210), font=a.font_s)
         if self.confirm:
             img2 = Image.blend(img, Image.new("RGB", img.size), 0.6)
