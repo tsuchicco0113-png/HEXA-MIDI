@@ -28,8 +28,11 @@ import os
 import select
 import signal
 import struct
+import subprocess
 import sys
 import time
+
+import numpy as np
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -41,6 +44,7 @@ from hm_music import (CHORD_HI_KEYS, CHORD_KEYS, FAVORITES, GM, NOTE_NAMES, SCAL
                       SCALE_ORDER, SCALES, ChordEngine, MelodyEngine, auto_chords, detect_key,
                       is_black, list_presets, note_name, scale_notes)
 from hm_song import Player, Song, list_songs, write_song                 # noqa: E402
+import hm_listen                                                          # noqa: E402
 
 VERSION = "0.2.0"
 LCD_W, LCD_H = 320, 170
@@ -53,7 +57,9 @@ EXT_COL = (80, 210, 255)                  # MIDI IN (外の鍵盤)
 GUIDE_COL = (255, 214, 90)                # 抜いたパート (降ってくる音)
 OK_COL = (120, 255, 160)
 CHORD_COL = (170, 140, 255)               # コードの音
-MODE_COL = {"FREE": (80, 210, 255), "SCALE": (255, 170, 60)}   # Aegis と同じ FREE=シアン / SCALE=アンバー
+MODE_COL = {"FREE": (80, 210, 255), "SCALE": (255, 170, 60), "BIRD": (120, 230, 120)}   # FREE=シアン / SCALE=アンバー / BIRD=緑
+MODES = ["FREE", "SCALE", "BIRD"]
+BIRD_COL = (120, 255, 200)
 SONG_DIRS = [os.path.join(DIR, "songs"), os.path.expanduser("~/midi")]
 CHORD_DIRS = [os.path.join(DIR, "chords"), os.path.expanduser("~/midi/chords")]
 CONFIG = os.path.expanduser("~/.config/hexamidi.json")
@@ -88,7 +94,9 @@ DEFAULTS = {"mode": "FREE", "layout": "PIANO", "oct": 0,
             "mel_prog": 0, "mel_vol": 110, "voice": "POLY", "glide_ms": 200,
             "key": "auto", "scale": "メジャー",
             "chordset": "auto", "chord_prog": 0, "chord_vol": 100, "hold": 350, "voicing": "厚め",
-            "thru": True, "reverb": 40, "tempo": 100, "wait": False, "song": ""}
+            "thru": True, "reverb": 40, "tempo": 100, "wait": False, "song": "",
+            "bird_thr": 20, "bird_follow": True, "bird_answer": False, "bird_prog": 73, "mic_pga": None}
+CH_BIRD = 13                              # 鳥に答える音 = ch14
 
 
 # ================================================================ キーボード (押した/離した を取る)
@@ -533,12 +541,21 @@ class App:
         self.rec = None                         # [(on秒, off秒, 音)] 曲の中の時間
         self.rec_open = {}                      # キーコード → (on秒, 音)
         self.editor = None                      # ﾀｲﾐﾝｸﾞ調整画面
+        self.listener = None                    # 鳥を聞く (BIRD ﾓｰﾄﾞの間だけ)
+        self.listen_source = os.environ.get("HEXAMIDI_MIC_FILE")   # PC 用: ﾏｲｸの代わりの WAV
+        self.bird_key = None                    # 鳴き声から推定した (主音, 種類)
+        self.bird_flash = {}                    # 鳴き声の音 → 光らせる時刻まで
+        self.bird_last = []                     # 最近の鳴き声 (表示用)
+        self._bird_key_t = 0.0
+        self._wf_map = None
         self.init_synth()
         if self.songs:
             names = [os.path.basename(p) for p in self.songs]
             i = names.index(self.cfg["song"]) if self.cfg["song"] in names else 0
             self.load_song(i, quiet=True)
         self.refresh_music()
+        if self.cfg["mode"] == "BIRD":
+            self.set_listening(True)
 
     # ---- 音源の初期化
     def init_synth(self):
@@ -561,6 +578,11 @@ class App:
         m.cc(CH_CHORD, 7, c["chord_vol"])
         m.cc(CH_MEL, 91, c["reverb"])
         m.cc(CH_CHORD, 91, c["reverb"] + 10)
+        m.program(CH_BIRD, c["bird_prog"])
+        m.cc(CH_BIRD, 7, 100)
+        m.cc(CH_BIRD, 91, c["reverb"] + 20)
+        if self.__dict__.get("listener") is not None:
+            self.listener.thr_db = c["bird_thr"]
         self.mel.set_mode(c["voice"])
         self.mel.glide_ms = c["glide_ms"]
         self.chord.hold_ms = c["hold"]
@@ -576,6 +598,10 @@ class App:
 
     def effective_key(self):
         """→ (主音 0-11, スケール名, 出どころの説明)"""
+        if self.bird_active():
+            pc, kind = self.bird_key
+            sc = self.cfg["scale"] if self.cfg["scale"] not in ("メジャー", "マイナー") else kind
+            return pc, sc, "鳥から"
         p = self.preset()
         if p and p.key is not None:
             return p.key, p.scale or self.cfg["scale"], "コードセット"
@@ -596,13 +622,13 @@ class App:
     def refresh_music(self):
         pc, sc, _ = self.effective_key()
         self.scale_list = scale_notes(self.scale_root(), SCALES[sc])
-        p = self.preset()
+        p = None if self.bird_active() else self.preset()
         self.chord.chords = p.chords if p else auto_chords(pc, sc, self.cfg["voicing"] == "厚め")
         self._kb_cache = None
 
     # ---- 鍵盤の範囲
     def kb_range(self):
-        if self.cfg["mode"] == "SCALE":
+        if self.is_scale():
             lo, hi = self.scale_list[0], self.scale_list[-1]
             lo -= 1 if is_black(lo) else 0
             hi += 1 if is_black(hi) else 0
@@ -612,7 +638,7 @@ class App:
 
     # ---- 音
     def note_for(self, code):
-        if self.cfg["mode"] == "SCALE":
+        if self.is_scale():
             if code in SCALE_CODES:
                 return self.scale_list[SCALE_CODES.index(code)]
             return None
@@ -667,7 +693,7 @@ class App:
             self.midi.note_off(ch, n)
         a["ringing"] = []
         if a["main"]:
-            n = self.scale_list[0] + 12 if self.cfg["mode"] == "SCALE" else 60 + 12 * self.cfg["oct"]
+            n = self.scale_list[0] + 12 if self.is_scale() else 60 + 12 * self.cfg["oct"]
             self.midi.note_on(CH_MEL, n, 100)
             a["ringing"].append((CH_MEL, n))
         if a["sub"]:
@@ -720,6 +746,101 @@ class App:
             return "なし"
         pg = self.player.song.program.get(ch, 0) if self.player.song else 0
         return f"ch{ch + 1} {GM[pg]}"
+
+    # ---- 鳥を聞く (BIRD ﾓｰﾄﾞ)
+    def is_scale(self):
+        return self.cfg["mode"] in ("SCALE", "BIRD")
+
+    def bird_active(self):
+        return self.cfg["mode"] == "BIRD" and self.cfg["bird_follow"] and self.bird_key is not None
+
+    def set_listening(self, on):
+        if on and self.listener is None:
+            self.apply_mic_gain()
+            self.listener = hm_listen.Listener(self.listen_source, thr_db=self.cfg["bird_thr"])
+            self.bird_key, self.bird_last = None, []
+        elif not on and self.listener is not None:
+            self.listener.close()
+            self.listener = None
+            self.bird_key = None
+            self.refresh_music()
+
+    def apply_mic_gain(self):
+        g = self.cfg.get("mic_pga")
+        if g is None or self.listen_source:
+            return
+        try:
+            subprocess.run(["amixer", "-q", "-c", "1", "sset", "ADCL PGA", str(g)], timeout=2)
+        except Exception:
+            pass
+
+    def bird_tick(self):
+        L = self.listener
+        if L is None:
+            return
+        now = time.time()
+        for c in L.take_new():
+            self.bird_last = (self.bird_last + [c])[-8:]
+            n = c.midi
+            self.bird_flash[n] = now + 0.6
+            if self.cfg["bird_answer"]:                # 鳴いたら答える (同じ高さを 2ｵｸﾀｰﾌﾞ下で)
+                dur = min(0.8, max(0.2, c.dur))
+                self.midi.note_on(CH_BIRD, n, 90)
+                self.bird_answer_off = (now + dur, n)
+                f0 = 440.0 * 2 ** ((n - 69) / 12)         # 答えた音の倍音 (2〜8倍) だけ拾わない
+                L.ignore = (time.monotonic() + dur + 0.3, [f0 * k for k in range(2, 9)])
+        off = getattr(self, "bird_answer_off", None)
+        if off and now >= off[0]:
+            self.midi.note_off(CH_BIRD, off[1])
+            self.bird_answer_off = None
+        if now - self._bird_key_t > 1.0:               # その場の調 (3声以上で)
+            self._bird_key_t = now
+            pc, kind, score, n, _ = L.key()
+            new = (pc, kind) if n >= 3 and score > 0.3 else None
+            if new and new != self.bird_key:
+                self.bird_key = new
+                if self.cfg["bird_follow"]:
+                    self.panic()
+                    self.refresh_music()
+                    self.say(f"鳥の調: {NOTE_NAMES[pc]} {kind}  ({n}声)", 2.5)
+
+    def draw_waterfall(self, img, top, bot):
+        """上の帯に声紋 (横=時間 0.05秒/1px、縦=高さ 1〜12kHz) と拾った鳴き声"""
+        L = self.listener
+        h = bot - top
+        if self._wf_map is None or self._wf_map[0] != h:
+            fr = L.freqs[L.show]
+            ys = np.geomspace(hm_listen.SHOW_HI, hm_listen.SHOW_LO, h)     # 上が高い音
+            self._wf_map = (h, np.clip(np.searchsorted(fr, ys), 0, len(fr) - 1), fr)
+        _, idx, fr = self._wf_map
+        with L.lock:
+            cols = list(L.cols)[-LCD_W:]
+            calls = [c for c in L.calls if c.t >= L.t - LCD_W * hm_listen.HOP / hm_listen.RATE]
+            t_now, thr = L.t, L.thr_db
+        d = ImageDraw.Draw(img)
+        if cols:
+            arr = np.stack([c[0][idx] for c in cols], axis=1)          # h × n
+            v = np.clip((arr - 6.0) / 24.0, 0, 1)                         # 雑音のざらつきは消す
+            rgb = np.stack([v * 60 + (v > 0.66) * 180 * (v - 0.66) / 0.34,
+                            v * 200, v * 150 + 30 * (v > 0)], axis=2).astype(np.uint8)
+            im = Image.fromarray(rgb, "RGB")
+            img.paste(im, (LCD_W - im.width, top))
+        for f, lab in ((2000, "2k"), (4000, "4k"), (8000, "8k")):
+            y = top + int(np.argmin(np.abs(np.geomspace(hm_listen.SHOW_HI, hm_listen.SHOW_LO, h) - f)))
+            d.line((0, y, 6, y), fill=(90, 98, 115))
+            d.text((8, y - 6), lab, fill=(90, 98, 115), font=self.font_k)
+        sec_px = hm_listen.RATE / hm_listen.HOP
+        ys = np.geomspace(hm_listen.SHOW_HI, hm_listen.SHOW_LO, h)
+        for c in calls:
+            x = LCD_W - (t_now - c.t) * sec_px
+            y = top + int(np.argmin(np.abs(ys - c.freq)))
+            d.text((x, max(top, y - 14)), c.name, fill=BIRD_COL, font=self.font_s)
+        info = f"しきい値 {thr:.0f}dB  {len(L.calls)}声"
+        if L.err and not cols:
+            info = f"ﾏｲｸを開けません: {L.err}"
+        elif not L.calls:
+            info = "鳥の声を待っています…  " + info
+        d.text((LCD_W - 4 - self.font_s.getlength(info), top + 2), info, fill=SUB, font=self.font_s)
 
     # ---- ﾀｲﾐﾝｸﾞ調整
     def open_editor(self):
@@ -836,7 +957,7 @@ class App:
     def key_labels(self):
         """音 → キー文字 (鍵盤に書く)"""
         out = {}
-        if self.cfg["mode"] == "SCALE":
+        if self.is_scale():
             for c, n in zip(SCALE_KEYS, self.scale_list):
                 out.setdefault(n, c.upper())
         else:
@@ -855,7 +976,7 @@ class App:
         d = ImageDraw.Draw(img)
         geo = self.kb_geom(start, span)
         labels = self.key_labels()
-        in_scale = set(self.scale_list) if self.cfg["mode"] == "SCALE" else None
+        in_scale = set(self.scale_list) if self.is_scale() else None
         for s, (x0, x1, black) in geo.items():
             if black:
                 continue
@@ -910,7 +1031,9 @@ class App:
             hit, ci, clusters = set(p.hit), p.ci, p.clusters
         ctimes = [c[0] for c in clusters]
         d.line((0, roll_bot, LCD_W, roll_bot), fill=ACC_DIM)
-        if song and (playing or vt > 0):
+        if self.cfg["mode"] == "BIRD" and self.listener is not None:
+            self.draw_waterfall(img, roll_top, roll_bot)
+        elif song and (playing or vt > 0):
             for ch in ([mute] if mute is not None else song.channels):
                 notes = song.notes.get(ch, [])
                 starts = [a for a, _, _ in notes]
@@ -951,6 +1074,11 @@ class App:
                 mark(n, CHORD_COL)
         for n in self.ext:
             mark(n, EXT_COL)
+        for n, until in list(self.bird_flash.items()):
+            if until < now:
+                del self.bird_flash[n]
+            else:
+                mark(n, BIRD_COL, full=False)
         for n in self.mel.sounding():
             mark(n, ACC)
         if waiting and ci < len(clusters):
@@ -975,7 +1103,7 @@ class App:
 
     def draw_chord_state(self, d, y):
         st = self.chord.state()
-        if not st or self.cfg["mode"] != "SCALE":
+        if not st or not self.is_scale():
             return
         name, tag = st
         col = {"KEEP": OK_COL, "KEEP>": OK_COL, "hold": GUIDE_COL, "ring": (255, 150, 60)}[tag]
@@ -986,7 +1114,7 @@ class App:
         d.text((x + 7, y + 5), t, fill=col, font=self.font_t)
 
     def draw_help(self, d, y):
-        if self.cfg["mode"] == "SCALE":
+        if self.is_scale():
             pc, sc, src = self.effective_key()
             d.text((8, y + 3), f"{NOTE_NAMES[pc]} {sc}  ({src})", fill=MODE_COL["SCALE"], font=self.font_s)
             for i, k in enumerate(CHORD_KEYS):
@@ -1051,6 +1179,12 @@ class App:
             parts.append((f"✓{len(p.hit)}/{len(p.clusters)}", OK_COL))
         if self.mel.sustain:
             parts.append(("SUS", ACC))
+        if mode == "BIRD":
+            bk = f"鳥 {NOTE_NAMES[self.bird_key[0]]}{'m' if self.bird_key[1] == 'マイナー' else ''}" \
+                if self.bird_key else "鳥 ?"
+            parts.append((bk, BIRD_COL))
+            if c["bird_answer"]:
+                parts.append(("答", BIRD_COL))
         if self.rec_armed:
             parts.insert(0, ("●REC" if self.rec is not None and p.playing else "●", (255, 70, 70)))
         xx = 4
@@ -1145,7 +1279,19 @@ class App:
                   lambda d: (setv("thru", not c["thru"]), self.ext.clear())),
                  ("reverb", "リバーブ", str(c["reverb"]),
                   lambda d: setv("reverb", max(0, min(127, c["reverb"] + 8 * d)), "main")),
-                 ("info", "送信", f"帯域 {self.midi.duty:.0f}%  滞留ピーク {self.midi.p0_peak}", None)]
+                 ("info", "送信", f"帯域 {self.midi.duty:.0f}%  滞留ピーク {self.midi.p0_peak}", None),
+                 ("鳥 (BIRD モード)",),
+                 ("bird_thr", "しきい値 (小さいほど敏感)", f"{c['bird_thr']} dB",
+                  lambda d: setv("bird_thr", max(8, min(40, c["bird_thr"] + 2 * d)))),
+                 ("bird_follow", "調を鳥に合わせる", "ON" if c["bird_follow"] else "OFF",
+                  lambda d: (setv("bird_follow", not c["bird_follow"]), self.refresh_music())),
+                 ("bird_answer", "鳴いたら答える (ALT)", "ON" if c["bird_answer"] else "OFF",
+                  lambda d: setv("bird_answer", not c["bird_answer"])),
+                 ("bird_prog", "答える音色", f"{c['bird_prog'] + 1} {GM[c['bird_prog']]}",
+                  lambda d: setv("bird_prog", (c["bird_prog"] + d) % 128)),
+                 ("mic_pga", "ﾏｲｸ感度 (ADCL PGA)", "そのまま" if c["mic_pga"] is None else f"{c['mic_pga']} / 14",
+                  lambda d: (setv("mic_pga", 8 if c["mic_pga"] is None else max(0, min(14, c["mic_pga"] + d)))
+                             , self.apply_mic_gain()))]
         return items
 
     def menu_selectable(self, items):
@@ -1224,7 +1370,7 @@ class App:
                 self.menu_key(code)
             return None
         c, p = self.cfg, self.player
-        if self.cfg["mode"] == "SCALE" and code in CHORD_CODES:
+        if self.is_scale() and code in CHORD_CODES:
             k = CHORD_CODES[code]
             if val:
                 if not self.chord.key_down(k):
@@ -1257,11 +1403,15 @@ class App:
             self.toast = ("", 0.0)
         elif code == K_TAB:
             self.panic()
-            c["mode"] = "SCALE" if c["mode"] == "FREE" else "FREE"
-            self._kb_cache = None
+            c["mode"] = MODES[(MODES.index(c["mode"]) + 1) % len(MODES)] if c["mode"] in MODES else "FREE"
+            self.set_listening(c["mode"] == "BIRD")
+            self.refresh_music()
             if c["mode"] == "SCALE":
                 pc, sc, _ = self.effective_key()
                 self.say(f"SCALE: {NOTE_NAMES[pc]} {sc}  数字/A段 = コード")
+            elif c["mode"] == "BIRD":
+                self.say("BIRD: 鳥の声を聞いて、その調で弾けます" if self.listener and not self.listener.err
+                         else f"ﾏｲｸを開けません {self.listener.err if self.listener else ''}", 3)
             else:
                 self.say(f"FREE: {c['layout']} 配列")
         elif code == K_SPACE:
@@ -1276,6 +1426,9 @@ class App:
         elif code == K_BS:
             self.save_rec()
             self.load_song(self.si + 1)
+        elif code in (K_LALT, K_RALT) and c["mode"] == "BIRD":
+            c["bird_answer"] = not c["bird_answer"]
+            self.say("鳴いたら答える ON" if c["bird_answer"] else "鳴いたら答える OFF", 1.5)
         elif code in (K_LALT, K_RALT):
             c["wait"] = not c["wait"]
             if c["wait"] and p.mute is None and p.song:
@@ -1336,6 +1489,7 @@ class App:
                         return "ESC"
             self.handle_in()
             self.audition_tick()
+            self.bird_tick()
             if self.player.ended and not was_end:
                 p = self.player
                 self.say(f"おわり ✓{len(p.hit)}/{len(p.clusters)}" if p.clusters else "おわり", 4)
@@ -1343,12 +1497,14 @@ class App:
             was_end = self.player.ended
             now = time.time()
             busy = (self.player.playing or self.mel.sounding() or self.ext or self.flash or self.chord.sounding
-                    or now < self.toast[1] + 0.3 or self.menu is not None or self.editor is not None)
+                    or now < self.toast[1] + 0.3 or self.menu is not None or self.editor is not None
+                    or self.listener is not None)
             if now - last > (0.066 if busy else 0.5):
                 self.fb.show(self.draw())
                 last = now
 
     def close(self):
+        self.set_listening(False)
         self.save_rec()
         self.panic()
         self.player.stop()
@@ -1474,7 +1630,7 @@ def run_sim(outdir):
               # 伴奏 + ﾏﾁ
               (0.1, (K_LALT, 1)), (0.1, (K_SPACE, 1)), (3.0, ("SNAP", "12_scale_wait.png")),
               (0.1, P("1")), (0.6, ("SNAP", "13_chord_over_song.png")), (0.0, R("1")),
-              (0.2, (K_SPACE, 1)), (0.3, (K_TAB, 1)), (0.3, ("SNAP", "14_back_free.png"))]
+              (0.2, (K_SPACE, 1)), (0.3, (K_TAB, 1)), (0.3, (K_TAB, 1)), (0.3, ("SNAP", "14_back_free.png"))]
     keys = SimKeys(script, fb, midi.inbox)
     cfg = dict(DEFAULTS)
     app = SimApp(fb, keys, midi, cfg=cfg, save=False)

@@ -86,6 +86,15 @@ def detect_key(song):
     if tail:
         hist[min(tail) % 12] += 0.25 * sum(hist)
 
+    pc, kind, _ = key_from_hist(hist)
+    return pc, kind
+
+
+def key_from_hist(hist):
+    """音名ごとの重み (12個) から調を推定 → (主音 0-11, 'メジャー'|'マイナー', 一致度 -1〜1)"""
+    if sum(hist) <= 0:
+        return 0, "メジャー", 0.0
+
     def corr(prof, k):
         p = [prof[(i - k) % 12] for i in range(12)]
         mx, mp = sum(hist) / 12, sum(p) / 12
@@ -94,7 +103,7 @@ def detect_key(song):
         return num / den if den else 0
     best = max([(corr(_KK_MAJ, k), k, "メジャー") for k in range(12)] +
                [(corr(_KK_MIN, k), k, "マイナー") for k in range(12)])
-    return best[1], best[2]
+    return best[1], best[2], best[0]
 
 
 # ================================================================ コード
